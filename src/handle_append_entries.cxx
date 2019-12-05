@@ -36,6 +36,23 @@ limitations under the License.
 
 namespace nuraft {
 
+void raft_server::append_entries_in_bg() {
+#ifdef __linux__
+    std::string thread_name = "nuraft_append";
+    pthread_setname_np(pthread_self(), thread_name.c_str());
+#endif
+    p_in("bg append_entries thread initiated");
+    do {
+        bg_append_ea_->wait();
+        bg_append_ea_->reset();
+        if (stopping_) break;
+
+        recur_lock(lock_);
+        request_append_entries();
+    } while (!stopping_);
+    p_in("bg append_entries thread terminated");
+}
+
 void raft_server::request_append_entries() {
     // Special case:
     //   1) one-node cluster, OR
@@ -46,7 +63,7 @@ void raft_server::request_append_entries() {
     // We should call it here.
     if ( peers_.size() == 0 ||
          get_quorum_for_commit() == 0 ) {
-        commit(log_store_->next_slot() - 1);
+        commit(precommit_index_.load());
         return;
     }
 
@@ -56,6 +73,13 @@ void raft_server::request_append_entries() {
 }
 
 bool raft_server::request_append_entries(ptr<peer> p) {
+    // Checking the validity of role first.
+    if (role_ != srv_role::leader) {
+        // WARNING: We should allow `write_paused_` state for
+        //          graceful resignation.
+        return false;
+    }
+
     cb_func::Param cb_param(id_, leader_, p->get_id());
     CbReturnCode rc = ctx_->cb_func_.call(cb_func::RequestAppendEntries, &cb_param);
     if (rc == CbReturnCode::ReturnNull) {
@@ -150,7 +174,7 @@ ptr<req_msg> raft_server::create_append_entries_req(peer& p) {
     {
         recur_lock(lock_);
         starting_idx = log_store_->start_index();
-        cur_nxt_idx = log_store_->next_slot();
+        cur_nxt_idx = precommit_index_ + 1;
         commit_idx = quick_commit_index_;
         term = state_->get_term();
     }
@@ -312,9 +336,18 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 {
     bool supp_exp_warning = false;
     if (catching_up_) {
-        p_in("catch-up process is done, "
-             "will suppress following expected warnings this time");
-        catching_up_ = false;
+        // WARNING:
+        //   We should clear the `catching_up_` flag only after this node's
+        //   config has been added to the cluster config. Otherwise, if we
+        //   clear it before that, any membership change configs (which is
+        //   already outdated but committed after the received snapshot)
+        //   may cause stepping down of this node.
+        ptr<cluster_config> cur_config = get_config();
+        ptr<srv_config> my_config = cur_config->get_server(id_);
+        if (my_config) {
+            p_in("catch-up process is done, clearing the flag");
+            catching_up_ = false;
+        }
         supp_exp_warning = true;
     }
 
@@ -413,7 +446,10 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
     // Callback if necessary.
     cb_func::Param param(id_, leader_, -1, &req);
-    ctx_->cb_func_.call(cb_func::GotAppendEntryReqFromLeader, &param);
+    cb_func::ReturnCode cb_ret =
+        ctx_->cb_func_.call(cb_func::GotAppendEntryReqFromLeader, &param);
+    // If callback function decided to refuse this request, return here.
+    if (cb_ret != cb_func::Ok) return resp;
 
     if (req.log_entries().size() > 0) {
         // Write logs to store, start from overlapped logs
@@ -582,6 +618,7 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     //   on next `append_entries()` call, due to racing
     //   between BG commit thread and appending logs.
     //   Hence, we always should take smaller one.
+    precommit_index_ = req.get_last_log_idx() + req.log_entries().size();
     commit( std::min( req.get_commit_idx(),
                       req.get_last_log_idx() + req.log_entries().size() ) );
 
@@ -744,7 +781,7 @@ ulong raft_server::get_expected_committed_log_idx() {
     matched_indexes.reserve(16);
 
     // Leader itself.
-    matched_indexes.push_back( log_store_->next_slot() - 1 );
+    matched_indexes.push_back( precommit_index_ );
     for (auto& entry: peers_) {
         ptr<peer>& p = entry.second;
 

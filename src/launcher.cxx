@@ -36,6 +36,8 @@ ptr<raft_server> raft_launcher::init(ptr<state_machine> sm,
 {
     asio_svc_ = cs_new<asio_service>(asio_options, lg);
     asio_listener_ = asio_svc_->create_rpc_listener(port_number, lg);
+    if (!asio_listener_) return nullptr;
+
     ptr<delayed_task_scheduler> scheduler = asio_svc_;
     ptr<rpc_client_factory> rpc_cli_factory = asio_svc_;
 
@@ -55,6 +57,7 @@ bool raft_launcher::shutdown(size_t time_limit_sec) {
     if (!raft_instance_) return false;
 
     raft_instance_->shutdown();
+    raft_instance_.reset();
 
     if (asio_listener_) {
         asio_listener_->stop();

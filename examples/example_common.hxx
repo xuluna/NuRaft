@@ -32,6 +32,13 @@ struct server_stuff {
         , raft_instance_(nullptr)
         {}
 
+    void reset() {
+        raft_logger_.reset();
+        sm_.reset();
+        smgr_.reset();
+        raft_instance_.reset();
+    }
+
     // Server ID.
     int server_id_;
 
@@ -186,6 +193,12 @@ void init_raft(ptr<state_machine> sm_instance) {
                                                 stuff.port_,
                                                 asio_opt,
                                                 params);
+    if (!stuff.raft_instance_) {
+        std::cerr << "Failed to initialize launcher (see the message "
+                     "in the log file)." << std::endl;
+        log_wrap.reset();
+        exit(-1);
+    }
 
     // Wait until Raft server is ready (upto 5 seconds).
     const size_t MAX_TRY = 20;
@@ -200,6 +213,7 @@ void init_raft(ptr<state_machine> sm_instance) {
         TestSuite::sleep_ms(250);
     }
     std::cout << " FAILED" << std::endl;
+    log_wrap.reset();
     exit(-1);
 }
 

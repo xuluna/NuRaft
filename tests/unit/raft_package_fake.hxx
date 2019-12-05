@@ -79,6 +79,8 @@ public:
         } else {
             params = *given_params;
         }
+        // For deterministic test, we should not use BG thread.
+        params.use_bg_thread_for_urgent_commit_ = false;
 
         ctx = new context( sMgr, sm, listener, myLog,
                            rpcCliFactory, scheduler, params );
@@ -165,7 +167,15 @@ static INT_UNUSED make_group(const std::vector<RaftPkg*>& pkgs) {
 
         // Heartbeat.
         leader->fTimer->invoke( timer_task_type::heartbeat_timer );
-        // Heartbeat req/resp, to finish the catch-up phase.
+        // The new node receives the commit of
+        // the new config (membership change), and now be the part of cluster.
+        leader->fNet->execReqResp();
+        // Wait for bg commit for new node.
+        TestSuite::sleep_ms(COMMIT_TIME_MS);
+
+        // One more heartbeat.
+        leader->fTimer->invoke( timer_task_type::heartbeat_timer );
+        // New node will clear the catch-up flag.
         leader->fNet->execReqResp();
         // Need one-more req/resp.
         leader->fNet->execReqResp();

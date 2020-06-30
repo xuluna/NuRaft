@@ -37,10 +37,13 @@ limitations under the License.
 namespace nuraft {
 
 void raft_server::append_entries_in_bg() {
-#ifdef __linux__
     std::string thread_name = "nuraft_append";
+#ifdef __linux__
     pthread_setname_np(pthread_self(), thread_name.c_str());
+#elif __APPLE__
+    pthread_setname_np(thread_name.c_str());
 #endif
+
     p_in("bg append_entries thread initiated");
     do {
         bg_append_ea_->wait();
@@ -50,6 +53,7 @@ void raft_server::append_entries_in_bg() {
         recur_lock(lock_);
         request_append_entries();
     } while (!stopping_);
+    append_bg_stopped_ = true;
     p_in("bg append_entries thread terminated");
 }
 
@@ -73,6 +77,8 @@ void raft_server::request_append_entries() {
 }
 
 bool raft_server::request_append_entries(ptr<peer> p) {
+    static timer_helper chk_timer(1000*1000);
+
     // Checking the validity of role first.
     if (role_ != srv_role::leader) {
         // WARNING: We should allow `write_paused_` state for
@@ -89,16 +95,55 @@ bool raft_server::request_append_entries(ptr<peer> p) {
 
     ptr<raft_params> params = ctx_->get_params();
 
+    if ( params->auto_adjust_quorum_for_small_cluster_ &&
+         get_num_voting_members() == 2 &&
+         chk_timer.timeout_and_reset() ) {
+        // If auto adjust mode is on for 2-node cluster, and
+        // the follower is not responding, adjust the quorum.
+        size_t num_not_responding_peers = get_not_responding_peers();
+        size_t cur_quorum_size = get_quorum_for_commit();
+        if ( num_not_responding_peers > 0 &&
+             cur_quorum_size >= 1 ) {
+            p_wn("2-node cluster's follower is not responding long time, "
+                 "adjust quorum to 1");
+            ptr<raft_params> clone = cs_new<raft_params>(*params);
+            clone->custom_commit_quorum_size_ = 1;
+            clone->custom_election_quorum_size_ = 1;
+            ctx_->set_params(clone);
+
+        } else if ( num_not_responding_peers == 0 &&
+                    params->custom_commit_quorum_size_ == 1 ) {
+            // Recovered.
+            p_wn("2-node cluster's follower is responding now, "
+                 "restore quorum with default value");
+            ptr<raft_params> clone = cs_new<raft_params>(*params);
+            clone->custom_commit_quorum_size_ = 0;
+            clone->custom_election_quorum_size_ = 0;
+            ctx_->set_params(clone);
+        }
+    }
+
     bool need_to_reconnect = p->need_to_reconnect();
     int32 last_active_time_ms = p->get_active_timer_us() / 1000;
     if ( last_active_time_ms >
-             params->heart_beat_interval_ * peer::RECONNECT_LIMIT ) {
-        p_wn( "connection to peer %d is not active long time: %zu ms, "
-              "force re-connect",
-              p->get_id(),
-              last_active_time_ms );
-        need_to_reconnect = true;
-        p->reset_active_timer();
+             params->heart_beat_interval_ *
+                 raft_server::raft_limits_.reconnect_limit_ ) {
+        if (srv_to_leave_ && srv_to_leave_->get_id() == p->get_id()) {
+            // We should not re-establish the connection to
+            // to-be-removed server, as it will block removing it
+            // from `peers_` list.
+            p_wn( "connection to peer %d is not active long time: %zu ms, "
+                  "but this peer should be removed. do nothing",
+                  p->get_id(),
+                  last_active_time_ms );
+        } else {
+            p_wn( "connection to peer %d is not active long time: %zu ms, "
+                  "force re-connect",
+                  p->get_id(),
+                  last_active_time_ms );
+            need_to_reconnect = true;
+            p->reset_active_timer();
+        }
     }
     if (need_to_reconnect) {
         reconnect_client(*p);
@@ -107,15 +152,31 @@ bool raft_server::request_append_entries(ptr<peer> p) {
 
     if (p->make_busy()) {
         p_tr("send request to %d\n", (int)p->get_id());
-        ptr<req_msg> msg = create_append_entries_req(*p);
+
+        // If reserved message exists, process it first.
+        ptr<req_msg> msg = p->get_rsv_msg();
+        rpc_handler m_handler = p->get_rsv_msg_handler();
+        if (msg) {
+            // Clear the reserved message.
+            p->set_rsv_msg(nullptr, nullptr);
+            p_in("found reserved message to peer %d, type %d",
+                 p->get_id(), msg->get_type());
+
+        } else {
+            // Normal message.
+            msg = create_append_entries_req(*p);
+            m_handler = resp_handler_;
+        }
         if (!msg) {
+            // Even normal message doesn't exist.
             p->set_free();
             return true;
         }
 
         if (!p->is_manual_free()) {
             // Actual recovery.
-            if (p->get_long_puase_warnings() >= peer::WARNINGS_LIMIT) {
+            if ( p->get_long_puase_warnings() >=
+                     raft_server::raft_limits_.warning_limit_ ) {
                 int32 last_ts_ms = p->get_ls_timer_us() / 1000;
                 p->inc_recovery_cnt();
                 p_wn( "recovered from long pause to peer %d, %d warnings, "
@@ -134,13 +195,32 @@ bool raft_server::request_append_entries(ptr<peer> p) {
             p->reset_long_pause_warnings();
 
         } else {
+            // FIXME: `manual_free` is deprecated, need to get rid of it.
+
             // It means that this is not an actual recovery,
             // but just temporarily freed busy flag.
             p->reset_manual_free();
         }
 
-        p->send_req(p, msg, resp_handler_);
+        p->send_req(p, msg, m_handler);
         p->reset_ls_timer();
+
+        if ( srv_to_leave_ &&
+             srv_to_leave_->get_id() == p->get_id() &&
+             msg->get_commit_idx() >= srv_to_leave_target_idx_ &&
+             !srv_to_leave_->is_stepping_down() ) {
+            // If this is the server to leave, AND
+            // current request's commit index includes
+            // the target log index number, step down and remove it
+            // as soon as we get the corresponding response.
+            srv_to_leave_->step_down();
+            p_in("srv_to_leave_ %d is safe to be erased from peer list, "
+                 "log idx %zu commit idx %zu, set flag",
+                 srv_to_leave_->get_id(),
+                 msg->get_last_log_idx(),
+                 msg->get_commit_idx());
+        }
+
         p_tr("sent\n");
         return true;
     }
@@ -151,12 +231,13 @@ bool raft_server::request_append_entries(ptr<peer> p) {
     if ( last_ts_ms > params->heart_beat_interval_ ) {
         // Waiting time becomes longer than HB interval, warning.
         p->inc_long_pause_warnings();
-        if (p->get_long_puase_warnings() < peer::WARNINGS_LIMIT) {
+        if (p->get_long_puase_warnings() < raft_server::raft_limits_.warning_limit_) {
             p_wn("skipped sending msg to %d too long time, "
                  "last msg sent %d ms ago",
                  p->get_id(), last_ts_ms);
 
-        } else if (p->get_long_puase_warnings() == peer::WARNINGS_LIMIT) {
+        } else if ( p->get_long_puase_warnings() ==
+                        raft_server::raft_limits_.warning_limit_ ) {
             p_wn("long pause warning to %d is too verbose, "
                  "will suppress it from now", p->get_id());
         }
@@ -413,7 +494,15 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
               local_snp->get_last_log_idx() == req.get_last_log_idx() &&
               local_snp->get_last_log_term() == req.get_last_log_term() );
 
-    p_lv( (log_okay ? L_TRACE : (supp_exp_warning ? L_INFO : L_WARN) ),
+    int log_lv = log_okay ? L_TRACE : (supp_exp_warning ? L_INFO : L_WARN);
+    static timer_helper log_timer(500*1000, true);
+    if (log_lv == L_WARN) {
+        // To avoid verbose logs.
+        if (!log_timer.timeout_and_reset()) {
+            log_lv = L_TRACE;
+        }
+    }
+    p_lv( log_lv,
           "[LOG %s] req log idx: %zu, req log term: %zu, my last log idx: %zu, "
           "my log (%zu) term: %zu",
           (log_okay ? "OK" : "XX"),
@@ -425,14 +514,14 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
 
     if ( req.get_term() < state_->get_term() ||
          log_okay == false ) {
-        p_lv( (supp_exp_warning ? L_INFO : L_WARN),
+        p_lv( log_lv,
               "deny, req term %zu, my term %zu, req log idx %zu, my log idx %zu",
               req.get_term(), state_->get_term(),
               req.get_last_log_idx(), log_store_->next_slot() - 1 );
         if (local_snp) {
-            p_wn("snp idx %zu term %zu",
-                 local_snp->get_last_log_idx(),
-                 local_snp->get_last_log_term());
+            p_lv( log_lv, "snp idx %zu term %zu",
+                  local_snp->get_last_log_idx(),
+                  local_snp->get_last_log_term() );
         }
         resp->set_next_batch_size_hint_in_bytes(
                 state_machine_->get_next_batch_size_hint_in_bytes() );
@@ -618,11 +707,39 @@ ptr<resp_msg> raft_server::handle_append_entries(req_msg& req)
     //   on next `append_entries()` call, due to racing
     //   between BG commit thread and appending logs.
     //   Hence, we always should take smaller one.
-    precommit_index_ = req.get_last_log_idx() + req.log_entries().size();
-    commit( std::min( req.get_commit_idx(),
-                      req.get_last_log_idx() + req.log_entries().size() ) );
+    ulong target_precommit_index = req.get_last_log_idx() + req.log_entries().size();
 
-    resp->accept(req.get_last_log_idx() + req.log_entries().size() + 1);
+    // WARNING:
+    //   Since `peer::set_free()` is called prior than response handler
+    //   without acquiring `raft_server::lock_`, there can be an edge case
+    //   that leader may send duplicate logs, and their last log index may not
+    //   be greater than the last log index this server already has. We should
+    //   always compare the target index with current precommit index, and take
+    //   it only when it is greater than the previous one.
+    const size_t MAX_ATTEMPTS = 10;
+    size_t num_attempts = 0;
+    ulong prev_precommit_index = precommit_index_;
+    while ( prev_precommit_index < target_precommit_index &&
+            num_attempts < MAX_ATTEMPTS ) {
+        if ( precommit_index_.compare_exchange_strong( prev_precommit_index,
+                                                       target_precommit_index ) ) {
+            break;
+        }
+        // Otherwise: retry until `precommit_index_` is equal to or greater than
+        //            `target_precommit_index`.
+        num_attempts++;
+    }
+    if (num_attempts >= MAX_ATTEMPTS) {
+        // If updating `precommit_index_` failed, we SHOULD NOT update
+        // commit index as well.
+        p_er("updating precommit_index_ failed after %zu attempts, "
+             "last seen precommit_index_ %zu, target %zu",
+             num_attempts, prev_precommit_index, target_precommit_index);
+    } else {
+        commit( std::min( req.get_commit_idx(), target_precommit_index ) );
+    }
+
+    resp->accept(target_precommit_index + 1);
 
     int32 time_ms = tt.get_us() / 1000;
     if (time_ms >= ctx_->get_params()->heart_beat_interval_) {
@@ -656,6 +773,21 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
     peer_itor it = peers_.find(resp.get_src());
     if (it == peers_.end()) {
         p_in("the response is from an unknown peer %d", resp.get_src());
+        return;
+    }
+
+    check_srv_to_leave_timeout();
+    if ( srv_to_leave_ &&
+         srv_to_leave_->get_id() == resp.get_src() &&
+         srv_to_leave_->is_stepping_down() &&
+         resp.get_next_idx() > srv_to_leave_target_idx_ ) {
+        // Catch-up is done.
+        p_in("server to be removed %d fully caught up the "
+             "target config log %zu",
+             srv_to_leave_->get_id(),
+             srv_to_leave_target_idx_);
+        remove_peer_from_peers(srv_to_leave_);
+        reset_srv_to_leave();
         return;
     }
 
@@ -695,6 +827,10 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
         need_to_catchup = p->clear_pending_commit() ||
                           resp.get_next_idx() < log_store_->next_slot();
 
+        if (srv_to_leave_ && srv_to_leave_->get_id() == p->get_id()) {
+
+        }
+
     } else {
         ulong prev_next_log = p->get_next_log_idx();
         std::lock_guard<std::mutex> guard(p->get_lock());
@@ -706,7 +842,16 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
             p->set_next_log_idx(p->get_next_log_idx() - 1);
         }
         bool suppress = p->need_to_suppress_error();
-        p_lv( (suppress ? L_INFO : L_WARN),
+
+        // To avoid verbose logs here.
+        static timer_helper log_timer(500*1000, true);
+        int log_lv = suppress ? L_INFO : L_WARN;
+        if (log_lv == L_WARN) {
+            if (!log_timer.timeout_and_reset()) {
+                log_lv = L_TRACE;
+            }
+        }
+        p_lv( log_lv,
               "declined append: peer %d, prev next log idx %zu, "
               "resp next %zu, new next log idx %zu",
               p->get_id(), prev_next_log,
@@ -721,7 +866,12 @@ void raft_server::handle_append_entries_resp(resp_msg& resp) {
     if ( write_paused_ &&
          p->get_id() == next_leader_candidate_ &&
          p_matched_idx &&
-         p_matched_idx == log_store_->next_slot() - 1 ) {
+         p_matched_idx == log_store_->next_slot() - 1 &&
+         p->make_busy() ) {
+        // NOTE:
+        //   If `make_busy` fails (very unlikely to happen), next
+        //   response handler (of heartbeat, append_entries ..) will
+        //   retry this.
         p_in("ready to resign, server id %d, "
              "latest log index %zu, "
              "%zu us elapsed, resign now",
@@ -784,9 +934,7 @@ ulong raft_server::get_expected_committed_log_idx() {
     matched_indexes.push_back( precommit_index_ );
     for (auto& entry: peers_) {
         ptr<peer>& p = entry.second;
-
-        // Skip learner.
-        if (p->is_learner()) continue;
+        if (!is_regular_member(p)) continue;
 
         matched_indexes.push_back( p->get_matched_idx() );
     }

@@ -22,6 +22,8 @@ limitations under the License.
 
 #include "tracer.hxx"
 
+#include <unordered_set>
+
 namespace nuraft {
 
 void peer::send_req( ptr<peer> myself,
@@ -79,6 +81,22 @@ void peer::handle_rpc_result( ptr<peer> myself,
                               ptr<resp_msg>& resp,
                               ptr<rpc_exception>& err )
 {
+    std::unordered_set<int> msg_types_to_free( {
+        msg_type::append_entries_request,
+        msg_type::install_snapshot_request,
+        msg_type::request_vote_request,
+        msg_type::pre_vote_request,
+        msg_type::leave_cluster_request,
+        msg_type::custom_notification_request,
+        msg_type::reconnect_request,
+        msg_type::priority_change_request
+    } );
+
+    if (abandoned_) {
+        p_in("peer %d has been shut down, ignore response.", config_->get_id());
+        return;
+    }
+
     if (req) {
         p_tr( "resp of req %d -> %d, type %s, %s",
               req->get_src(),
@@ -89,14 +107,32 @@ void peer::handle_rpc_result( ptr<peer> myself,
 
     if (err == nilptr) {
         // Succeeded.
-        if ( req->get_type() == msg_type::append_entries_request ||
-             req->get_type() == msg_type::install_snapshot_request ) {
+        {   std::lock_guard<std::mutex> l(rpc_protector_);
+            // The same as below, freeing busy flag should be done
+            // only if the RPC hasn't been changed.
+            uint64_t cur_rpc_id = rpc_ ? rpc_->get_id() : 0;
+            uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
+            if (cur_rpc_id != given_rpc_id) {
+                p_wn( "[EDGE CASE] got stale RPC response from %d: "
+                      "current %p (%zu), from parameter %p (%zu). "
+                      "will ignore this response",
+                      config_->get_id(),
+                      rpc_.get(),
+                      cur_rpc_id,
+                      my_rpc_client.get(),
+                      given_rpc_id );
+                return;
+            }
+        }
+
+        if ( msg_types_to_free.find(req->get_type()) != msg_types_to_free.end() ) {
             set_free();
         }
 
         reset_active_timer();
         resume_hb_speed();
         ptr<rpc_exception> no_except;
+        resp->set_peer(myself);
         pending_result->set_result(resp, no_except);
 
         reconn_backoff_.reset();
@@ -115,10 +151,12 @@ void peer::handle_rpc_result( ptr<peer> myself,
         // Destroy this connection, we MUST NOT re-use existing socket.
         // Next append operation will create a new one.
         {   std::lock_guard<std::mutex> l(rpc_protector_);
-            if (rpc_.get() == my_rpc_client.get()) {
+            uint64_t cur_rpc_id = rpc_ ? rpc_->get_id() : 0;
+            uint64_t given_rpc_id = my_rpc_client ? my_rpc_client->get_id() : 0;
+            if (cur_rpc_id == given_rpc_id) {
                 rpc_.reset();
-                if ( req->get_type() == msg_type::append_entries_request ||
-                     req->get_type() == msg_type::install_snapshot_request ) {
+                if ( msg_types_to_free.find(req->get_type()) !=
+                         msg_types_to_free.end() ) {
                     set_free();
                 }
 
@@ -128,10 +166,12 @@ void peer::handle_rpc_result( ptr<peer> myself,
                 //   error. Those two are different instances and we
                 //   SHOULD NOT reset the new one.
                 p_wn( "[EDGE CASE] RPC for %d has been reset before "
-                      "returning error: current %p, from parameter %p",
+                      "returning error: current %p (%zu), from parameter %p (%zu)",
                       config_->get_id(),
                       rpc_.get(),
-                      my_rpc_client.get() );
+                      cur_rpc_id,
+                      my_rpc_client.get(),
+                      given_rpc_id );
             }
         }
     }

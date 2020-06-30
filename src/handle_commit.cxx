@@ -83,9 +83,11 @@ void raft_server::commit(ulong target_idx) {
 }
 
 void raft_server::commit_in_bg() {
-#ifdef __linux__
     std::string thread_name = "nuraft_commit";
+#ifdef __linux__
     pthread_setname_np(pthread_self(), thread_name.c_str());
+#elif __APPLE__
+    pthread_setname_np(thread_name.c_str());
 #endif
 
     while (true) {
@@ -128,30 +130,38 @@ void raft_server::commit_in_bg() {
 
         while ( sm_commit_index_ < quick_commit_index_ &&
                 sm_commit_index_ < log_store_->next_slot() - 1 ) {
-            sm_commit_index_ += 1;
-            ptr<log_entry> le = log_store_->entry_at(sm_commit_index_);
+            ulong index_to_commit = sm_commit_index_ + 1;
+            ptr<log_entry> le = log_store_->entry_at(index_to_commit);
             p_tr( "commit upto %llu, curruent idx %llu\n",
-                  quick_commit_index_.load(), sm_commit_index_.load() );
+                  quick_commit_index_.load(), index_to_commit );
 
             if (le->get_term() == 0) {
                 // LCOV_EXCL_START
                 // Zero term means that log store is corrupted
                 // (failed to read log).
                 p_ft( "empty log at idx %llu, must be log corruption",
-                      sm_commit_index_.load() );
+                      index_to_commit );
                 ctx_->state_mgr_->system_exit(raft_err::N19_bad_log_idx_for_term);
                 ::exit(-1);
                 // LCOV_EXCL_STOP
             }
 
             if (le->get_val_type() == log_val_type::app_log) {
-                commit_app_log(le, need_to_handle_commit_elem);
+                commit_app_log(index_to_commit, le, need_to_handle_commit_elem);
 
             } else if (le->get_val_type() == log_val_type::conf) {
-                commit_conf(le);
+                commit_conf(index_to_commit, le);
             }
 
-            snapshot_and_compact(sm_commit_index_);
+            ulong exp_idx = index_to_commit - 1;
+            if (sm_commit_index_.compare_exchange_strong(exp_idx, index_to_commit)) {
+                snapshot_and_compact(sm_commit_index_);
+            } else {
+                p_er("sm_commit_index_ has been changed to %zu, "
+                     "this thread attempted %zu",
+                     exp_idx,
+                     index_to_commit);
+            }
         }
         p_db( "DONE: commit upto %ld, curruent idx %ld\n",
               quick_commit_index_.load(), sm_commit_index_.load() );
@@ -188,13 +198,14 @@ void raft_server::commit_in_bg() {
     commit_bg_stopped_ = true;
 }
 
-void raft_server::commit_app_log(ptr<log_entry>& le,
+void raft_server::commit_app_log(ulong idx_to_commit,
+                                 ptr<log_entry>& le,
                                  bool need_to_handle_commit_elem)
 {
     ptr<buffer> ret_value = nullptr;
     ptr<buffer> buf = le->get_buf_ptr();
     buf->pos(0);
-    ulong sm_idx = sm_commit_index_.load();
+    ulong sm_idx = idx_to_commit;
     ulong pc_idx = precommit_index_.load();
     if (pc_idx < sm_idx) {
         // Pre-commit should have been invoked, must be a bug.
@@ -277,7 +288,8 @@ void raft_server::commit_app_log(ptr<log_entry>& le,
     }
 }
 
-void raft_server::commit_conf(ptr<log_entry>& le) {
+void raft_server::commit_conf(ulong idx_to_commit,
+                              ptr<log_entry>& le) {
     recur_lock(lock_);
     le->get_buf().pos(0);
     ptr<cluster_config> new_conf =
@@ -294,7 +306,7 @@ void raft_server::commit_conf(ptr<log_entry>& le) {
     }
 
     cb_func::Param param(id_, leader_);
-    uint64_t log_idx = sm_commit_index_;
+    uint64_t log_idx = idx_to_commit;
     param.ctx = &log_idx;
     ctx_->cb_func_.call(cb_func::NewConfig, &param);
 
@@ -495,6 +507,7 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
         }
         if (id_ == (*it)->get_id()) {
             my_priority_ = (*it)->get_priority();
+            steps_to_down_ = 0;
             if (role_ == srv_role::follower &&
                 catching_up_) {
                 // If this node is newly added, start election timer
@@ -582,17 +595,50 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
             CbReturnCode rc = ctx_->cb_func_.call( cb_func::RemovedFromCluster,
                                                    &param );
             (void)rc;
+            steps_to_down_ = 2;
         }
 
         peer_itor pit = peers_.find(srv_removed);
         if (pit != peers_.end()) {
-            pit->second->enable_hb(false);
+            // WARNING:
+            //   We should not remove the peer from the list immediately,
+            //   due to the issue described below:
+            //
+            // 0) Let's suppose there are 3 servers: S1, S2, and S3,
+            //    where S1 is the leader and S3 is going to leave.
+            // 1) Generate a conf log for removing server S3.
+            // 2) The conf log is committed by S1 and S2 only.
+            // 3) Before delivering the conf log to S3, S1 removes
+            //    the S3 peer info from the list.
+            // 4) It closes the connection to S3.
+            // 5) S3 cannot commit the config (containing removing S3).
+            // 6) Callback function for `RemovedFromCluster` will be missing,
+            //    but S3 will step down itself after 2 timeout period.
+            //
+            // To address it, we will remove S3 only after the commit index
+            // of the last config is delivered to S3.
+            // Also we will have timeout for it. If we fail to deliver the
+            // commit index, S3 will be just force removed.
+            const ptr<peer>& pp = pit->second;
 
-            sprintf(temp_buf, "remove peer %d\n", srv_removed);
-            str_buf += temp_buf;
+            if (role_ == srv_role::leader && srv_to_leave_) {
+                // If leader, keep the to-be-removed server in peer list
+                // until 1) catch-up is done, or 2) timeout.
 
-            peers_.erase(pit);
-            p_in("server %d is removed from cluster", srv_removed);
+                // However, if `srv_to_leave_` is NULL,
+                // it is replaying old config. We can remove it
+                // immediately without setting `srv_to_leave_`.
+
+            } else {
+                if (!srv_to_leave_) {
+                    p_in("srv_to_leave_ is currently empty "
+                         "on config for removing %d",
+                         pp->get_id());
+                }
+                remove_peer_from_peers(pp);
+                sprintf(temp_buf, "remove peer %d\n", srv_removed);
+                str_buf += temp_buf;
+            }
         } else {
             p_in("peer %d cannot be found, no action for removing", srv_removed);
         }
@@ -647,6 +693,12 @@ void raft_server::reconfigure(const ptr<cluster_config>& new_config) {
          str_buf.c_str(), id_, leader_.load(), state_->get_term());
 
     update_target_priority();
+}
+
+void raft_server::remove_peer_from_peers(const ptr<peer>& pp) {
+    p_in("server %d is removed from cluster", pp->get_id());
+    pp->enable_hb(false);
+    peers_.erase(pp->get_id());
 }
 
 } // namespace nuraft;

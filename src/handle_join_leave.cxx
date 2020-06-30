@@ -54,6 +54,8 @@ ptr<resp_msg> raft_server::handle_add_srv_req(req_msg& req) {
         return resp;
     }
 
+    // Before checking duplicate ID, confirm srv_to_leave_ is gone.
+    check_srv_to_leave_timeout();
     ptr<srv_config> srv_conf =
         srv_config::deserialize( entries[0]->get_buf() );
     if ( peers_.find( srv_conf->get_id() ) != peers_.end() ||
@@ -83,7 +85,7 @@ ptr<resp_msg> raft_server::handle_add_srv_req(req_msg& req) {
              last_active_ms);
 
         if ( last_active_ms <=
-                 (ulong)peer::RESPONSE_LIMIT *
+                 (ulong)raft_server::raft_limits_.response_limit_ *
                  ctx_->get_params()->heart_beat_interval_ ) {
             resp->set_result_code(cmd_result_code::SERVER_IS_JOINING);
             return resp;
@@ -182,7 +184,7 @@ ptr<resp_msg> raft_server::handle_join_cluster_req(req_msg& req) {
 }
 
 void raft_server::handle_join_cluster_resp(resp_msg& resp) {
-    if (srv_to_join_) {
+    if (srv_to_join_ && srv_to_join_ == resp.get_peer()) {
         if (resp.get_accepted()) {
             p_in("new server (%d) confirms it will join, "
                  "start syncing logs to it", srv_to_join_->get_id());
@@ -202,7 +204,8 @@ void raft_server::sync_log_to_new_srv(ulong start_idx) {
     // only sync committed logs
     int32 gap = (int64_t)quick_commit_index_ - (int64_t)start_idx;
     ptr<raft_params> params = ctx_->get_params();
-    if (gap < params->log_sync_stop_gap_) {
+    if ( gap < params->log_sync_stop_gap_ ||
+         params->log_sync_stop_gap_ == 0 ) {
         p_in( "[SYNC LOG] LogSync is done for server %d "
               "with log gap %d (%zu - %zu, limit %d), "
               "now put the server into cluster",
@@ -340,6 +343,27 @@ ptr<resp_msg> raft_server::handle_rm_srv_req(req_msg& req) {
         return resp;
     }
 
+    check_srv_to_leave_timeout();
+    if (srv_to_leave_) {
+        p_wn("previous to-be-removed server %d has not left yet",
+             srv_to_leave_->get_id());
+        resp->set_result_code(cmd_result_code::SERVER_IS_LEAVING);
+        return resp;
+    }
+    // NOTE:
+    //   Although `srv_to_leave_` is not set, we should check if
+    //   there is any peer whose leave flag is set.
+    for (auto& entry: peers_) {
+        ptr<peer> pp = entry.second;
+        if (pp->is_leave_flag_set()) {
+            p_wn("leave flag of server %d is set, but the server "
+                 "has not left yet",
+                 pp->get_id());
+            resp->set_result_code(cmd_result_code::SERVER_IS_LEAVING);
+            return resp;
+        }
+    }
+
     if (config_changing_) {
         // the previous config has not committed yet
         p_wn("previous config has not committed yet");
@@ -368,14 +392,19 @@ ptr<resp_msg> raft_server::handle_rm_srv_req(req_msg& req) {
                               id_, srv_id, 0,
                               log_store_->next_slot() - 1,
                               quick_commit_index_.load() ) );
-    p->send_req(p, leave_req, ex_resp_handler_);
     // WARNING:
     //   DO NOT reset HB counter to 0 as removing server
     //   may be requested multiple times, and anyway we should
     //   remove that server.
     p->set_leave_flag();
 
-    p_in("sent leave request to peer %d", p->get_id());
+    if (p->make_busy()) {
+        p->send_req(p, leave_req, ex_resp_handler_);
+        p_in("sent leave request to peer %d", p->get_id());
+    } else {
+        p->set_rsv_msg(leave_req, ex_resp_handler_);
+        p_in("peer %d is currently busy, keep the message", p->get_id());
+    }
 
     resp->accept(log_store_->next_slot());
     return resp;
@@ -407,15 +436,11 @@ void raft_server::handle_leave_cluster_resp(resp_msg& resp) {
 }
 
 void raft_server::rm_srv_from_cluster(int32 srv_id) {
-    // WARNING: before removing server from configuration,
-    //          set step down flag of the peer first
-    //          to avoid HB handler doing something with it.
-    auto pit = peers_.find(srv_id);
-    if (pit == peers_.end()) {
-        p_er("trying to remove server %d, but it does not exist now", srv_id);
-    } else {
-        ptr<peer> pp = pit->second;
-        pp->step_down();
+    if (srv_to_leave_) {
+        p_wn("to-be-removed server %d already exists, "
+             "cannot remove server %d for now",
+             srv_to_leave_->get_id(), srv_id);
+        return;
     }
 
     ptr<cluster_config> cur_conf = get_config();
@@ -455,12 +480,23 @@ void raft_server::rm_srv_from_cluster(int32 srv_id) {
                                              new_conf_buf,
                                              log_val_type::conf ) );
     store_log_entry(entry);
+
+    auto p_entry = peers_.find(srv_id);
+    if (p_entry != peers_.end()) {
+        ptr<peer> pp = p_entry->second;
+        srv_to_leave_ = pp;
+        srv_to_leave_target_idx_ = new_conf->get_log_idx();
+        p_in("set srv_to_leave_, "
+             "server %d will be removed from cluster, config %zu",
+             srv_id, srv_to_leave_target_idx_);
+    }
+
     request_append_entries();
 }
 
 void raft_server::handle_join_leave_rpc_err(msg_type t_msg, ptr<peer> p) {
     if (t_msg == msg_type::leave_cluster_request) {
-        p_in( "rpc failed again for the removing server (%d), "
+        p_in( "rpc failed for removing server (%d), "
               "will remove this server directly",
               p->get_id() );
 
@@ -484,10 +520,13 @@ void raft_server::handle_join_leave_rpc_err(msg_type t_msg, ptr<peer> p) {
                 pit->second->enable_hb(false);
                 peers_.erase(pit);
                 p_in("server %d is removed from cluster", p->get_id());
+            } else {
+                p_in("peer %d cannot be found, no action for removing",
+                     p->get_id());
             }
-            else {
-                p_in( "peer %d cannot be found, no action for removing",
-                      p->get_id() );
+
+            if (srv_to_leave_) {
+                reset_srv_to_leave();
             }
         }
 
@@ -509,7 +548,15 @@ void raft_server::reset_srv_to_join() {
         void*& user_ctx = sync_ctx->get_user_snp_ctx();
         state_machine_->free_user_snp_ctx(user_ctx);
     }
+    srv_to_join_->shutdown();
     srv_to_join_.reset();
+}
+
+void raft_server::reset_srv_to_leave() {
+    srv_to_leave_->shutdown();
+    srv_to_leave_.reset();
+    srv_to_leave_target_idx_ = 0;
+    p_in("clearing srv_to_leave_");
 }
 
 } // namespace nuraft;

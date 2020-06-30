@@ -45,10 +45,11 @@ bool raft_server::check_cond_for_zp_election() {
 }
 
 void raft_server::request_prevote() {
+    ptr<raft_params> params = ctx_->get_params();
     ptr<cluster_config> c_config = get_config();
     for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
         ptr<peer> pp = it->second;
-        if (pp->is_learner()) continue;
+        if (!is_regular_member(pp)) continue;
         ptr<srv_config> s_config = c_config->get_server( pp->get_id() );
 
         if (s_config) {
@@ -60,16 +61,62 @@ void raft_server::request_prevote() {
             } else {
                 // Since second time: reset only if `rpc_` is null.
                 recreate = pp->need_to_reconnect();
+
+                // Or if it is not active long time, reconnect as well.
+                int32 last_active_time_ms = pp->get_active_timer_us() / 1000;
+                if ( last_active_time_ms >
+                         params->heart_beat_interval_ *
+                             raft_server::raft_limits_.reconnect_limit_ ) {
+                    p_wn( "connection to peer %d is not active long time: %zu ms, "
+                          "need reconnection for prevote",
+                          pp->get_id(),
+                          last_active_time_ms );
+                    recreate = true;
+                }
             }
 
             if (recreate) {
                 p_in("reset RPC client for peer %d", s_config->get_id());
                 pp->recreate_rpc(s_config, *ctx_);
+                pp->set_free();
+                pp->set_manual_free();
             }
         }
     }
 
+    int quorum_size = get_quorum_for_election();
+    if (pre_vote_.live_ + pre_vote_.dead_ > 0) {
+        if (pre_vote_.live_ + pre_vote_.dead_ < quorum_size + 1) {
+            // Pre-vote failed due to non-responding voters.
+            pre_vote_.failure_count_++;
+            p_wn("total %zu nodes (including this node) responded for pre-vote "
+                 "(term %zu, live %zu, dead %zu), at least %zu nodes should "
+                 "respond. failure count %zu",
+                 pre_vote_.live_.load() + pre_vote_.dead_.load(),
+                 pre_vote_.term_,
+                 pre_vote_.live_.load(),
+                 pre_vote_.dead_.load(),
+                 quorum_size + 1,
+                 pre_vote_.failure_count_.load());
+        } else {
+            pre_vote_.failure_count_ = 0;
+        }
+    }
+    int num_voting_members = get_num_voting_members();
+    if ( params->auto_adjust_quorum_for_small_cluster_ &&
+         num_voting_members == 2 &&
+         pre_vote_.failure_count_ > raft_server::raft_limits_.vote_limit_ ) {
+        // 2-node cluster's pre-vote failed due to offline node.
+        p_wn("2-node cluster's pre-vote is failing long time, "
+             "adjust quorum to 1");
+        ptr<raft_params> clone = cs_new<raft_params>(*params);
+        clone->custom_commit_quorum_size_ = 1;
+        clone->custom_election_quorum_size_ = 1;
+        ctx_->set_params(clone);
+    }
+
     hb_alive_ = false;
+    leader_ = -1;
     pre_vote_.reset(state_->get_term());
     // Count for myself.
     pre_vote_.dead_++;
@@ -94,7 +141,7 @@ void raft_server::request_prevote() {
 
     for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
         ptr<peer> pp = it->second;
-        if (pp->is_learner()) {
+        if (!is_regular_member(pp)) {
             // Do not send voting request to learner.
             continue;
         }
@@ -107,7 +154,12 @@ void raft_server::request_prevote() {
                             term_for_log(log_store_->next_slot() - 1),
                             log_store_->next_slot() - 1,
                             quick_commit_index_.load() ) );
-        pp->send_req(pp, req, resp_handler_);
+        if (pp->make_busy()) {
+            pp->send_req(pp, req, resp_handler_);
+        } else {
+            p_wn("failed to send prevote request: peer %d (%s) is busy",
+                 pp->get_id(), pp->get_endpoint().c_str());
+        }
     }
 }
 
@@ -128,7 +180,11 @@ void raft_server::initiate_vote(bool ignore_priority) {
         ctx_->state_mgr_->save_state(*state_);
         request_vote(ignore_priority);
     }
-    hb_alive_ = false;
+
+    if (role_ != srv_role::leader) {
+        hb_alive_ = false;
+        leader_ = -1;
+    }
 }
 
 void raft_server::request_vote(bool ignore_priority) {
@@ -152,7 +208,7 @@ void raft_server::request_vote(bool ignore_priority) {
 
     for (peer_itor it = peers_.begin(); it != peers_.end(); ++it) {
         ptr<peer> pp = it->second;
-        if (pp->is_learner()) {
+        if (!is_regular_member(pp)) {
             // Do not send voting request to learner.
             continue;
         }
@@ -179,7 +235,12 @@ void raft_server::request_vote(bool ignore_priority) {
               msg_type_to_string(req->get_type()).c_str(),
               it->second->get_id(),
               state_->get_term() );
-        pp->send_req(pp, req, resp_handler_);
+        if (pp->make_busy()) {
+            pp->send_req(pp, req, resp_handler_);
+        } else {
+            p_wn("failed to send vote request: peer %d (%s) is busy",
+                 pp->get_id(), pp->get_endpoint().c_str());
+        }
     }
 }
 
@@ -291,18 +352,9 @@ void raft_server::handle_vote_resp(resp_msg& resp) {
 }
 
 ptr<resp_msg> raft_server::handle_prevote_req(req_msg& req) {
-    // Once we get a pre-vote request from a peer,
-    // it means that the peer has not received any messages or heartbeats,
-    // so that we should clear the busy flag of it.
     ulong next_idx_for_resp = 0;
     auto entry = peers_.find(req.get_src());
-    if (entry != peers_.end()) {
-        peer* pp = entry->second.get();
-        if (pp->is_busy()) {
-            p_in("busy_flag of peer %d was set, clear the flag.", req.get_src());
-            pp->set_free();
-        }
-    } else {
+    if (entry == peers_.end()) {
         // This node already has been removed, set a special value.
         next_idx_for_resp = std::numeric_limits<ulong>::max();
     }
@@ -401,7 +453,7 @@ void raft_server::handle_prevote_resp(resp_msg& resp) {
         p_wn("[PRE-VOTE] rejected by quorum, count %zu",
              pre_vote_.quorum_reject_count_.load());
         if ( pre_vote_.quorum_reject_count_ >=
-                 raft_server::PRE_VOTE_REJECTION_LIMIT ) {
+                 raft_server::raft_limits_.pre_vote_rejection_limit_ ) {
             p_ft("too many pre-vote rejections, probably this node is not "
                  "receiving heartbeat from leader. "
                  "we should re-establish the network connection");

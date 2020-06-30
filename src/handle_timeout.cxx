@@ -38,8 +38,26 @@ void raft_server::enable_hb_for_peer(peer& p) {
     schedule_task(p.get_hb_task(), p.get_current_hb_interval());
 }
 
+void raft_server::check_srv_to_leave_timeout() {
+    if (!srv_to_leave_) return;
+    ulong last_resp_ms = srv_to_leave_->get_resp_timer_us() / 1000;
+    if ( last_resp_ms >
+             (ulong)raft_server::raft_limits_.leave_limit_ *
+             ctx_->get_params()->heart_beat_interval_ ) {
+        // Timeout: remove peer.
+        p_wn("server to be removed %d, response timeout %zu ms. "
+             "force remove now",
+             srv_to_leave_->get_id(),
+             last_resp_ms);
+        remove_peer_from_peers(srv_to_leave_);
+        reset_srv_to_leave();
+    }
+}
+
 void raft_server::handle_hb_timeout(int32 srv_id) {
     recur_lock(lock_);
+
+    check_srv_to_leave_timeout();
 
     if (write_paused_ && reelection_timer_.timeout()) {
         p_in("resign by timeout, %zu us elapsed, resign now",
@@ -69,15 +87,13 @@ void raft_server::handle_hb_timeout(int32 srv_id) {
         p_in("peer %d is not responding for %d HBs since leave request",
              p->get_id(), cur_cnt);
 
-        if (cur_cnt >= peer::LEAVE_LIMIT) {
+        if (cur_cnt >= raft_server::raft_limits_.leave_limit_) {
             // Force remove the server.
             p_er("force remove peer %d", p->get_id());
             handle_join_leave_rpc_err(msg_type::leave_cluster_request, p);
             return;
         }
     }
-
-    if (p->is_stepping_down()) return;
 
     cb_func::Param param(id_, leader_, p->get_id());
     uint64_t last_log_idx = log_store_->next_slot() - 1;

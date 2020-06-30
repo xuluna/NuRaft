@@ -28,6 +28,7 @@ limitations under the License.
 #include "asio_service.hxx"
 
 #include "buffer_serializer.hxx"
+#include "callback.hxx"
 #include "crc32.hxx"
 #include "internal_timer.hxx"
 #include "rpc_listener.hxx"
@@ -162,6 +163,7 @@ public:
 
     const asio_service::options& get_options() const { return my_opt_; }
     asio::io_service& get_io_svc() { return io_svc_; }
+    uint64_t assign_client_id() { return client_id_counter_.fetch_add(1); }
 
 private:
 #ifndef SSL_LIBRARY_NOT_FOUND
@@ -186,6 +188,7 @@ private:
     std::atomic<uint32_t> worker_id_;
     std::list< ptr<std::thread> > worker_handles_;
     asio_service::options my_opt_;
+    std::atomic<uint64_t> client_id_counter_;
     ptr<logger> l_;
     friend asio_service;
 };
@@ -215,6 +218,8 @@ public:
         , header_(buffer::alloc(RPC_REQ_HEADER_SIZE))
         , l_(logger)
         , callback_(callback)
+        , src_id_(-1)
+        , is_leader_(false)
     {
         p_tr("asio rpc session created: %p", this);
     }
@@ -369,6 +374,7 @@ public:
     }
 
     void stop() {
+        invoke_connection_callback(false);
         close_socket();
         if (callback_) {
             callback_(this->shared_from_this());
@@ -381,6 +387,27 @@ public:
     }
 
 private:
+    void invoke_connection_callback(bool is_open) {
+        if (is_leader_ && src_id_ != handler_->get_leader()) {
+            // Leader has been changed without closing session.
+            is_leader_ = false;
+        }
+
+        cb_func::ConnectionArgs
+            args( session_id_,
+                  socket_.remote_endpoint().address().to_string(),
+                  socket_.remote_endpoint().port(),
+                  src_id_,
+                  is_leader_ );
+        cb_func::Param cb_param( handler_->get_id(),
+                                 handler_->get_leader(),
+                                 -1,
+                                 &args );
+        handler_->invoke_callback
+            ( is_open ? cb_func::ConnectionOpened : cb_func::ConnectionClosed,
+              &cb_param );
+    }
+
     void close_socket() {
         // MONSTOR-9378: Do nothing (the same as in `asio_rpc_client`),
         // early closing socket before destroying this instance
@@ -421,6 +448,44 @@ private:
         ulong last_term = hdr->get_ulong();
         ulong last_idx = hdr->get_ulong();
         ulong commit_idx = hdr->get_ulong();
+
+        if (src_id_ == -1) {
+            // It means this is the first message on this session.
+            // Invoke callback function of new connection.
+            src_id_ = src;
+            invoke_connection_callback(true);
+
+        } else if (is_leader_ && src_id_ != handler_->get_leader()) {
+            // Leader has been changed without closing session.
+            is_leader_ = false;
+        }
+
+        if (!is_leader_) {
+            // If leader flag is not set, we identify whether the endpoint
+            // server is leader based on the message type (only leader
+            // can send below message types).
+            if ( t == msg_type::append_entries_request ||
+                 t == msg_type::sync_log_request ||
+                 t == msg_type::join_cluster_request ||
+                 t == msg_type::leave_cluster_request ||
+                 t == msg_type::install_snapshot_request ||
+                 t == msg_type::priority_change_request ||
+                 t == msg_type::custom_notification_request ) {
+                is_leader_ = true;
+                cb_func::ConnectionArgs
+                    args( session_id_,
+                          socket_.remote_endpoint().address().to_string(),
+                          socket_.remote_endpoint().port(),
+                          src_id_,
+                          is_leader_ );
+                cb_func::Param cb_param( handler_->get_id(),
+                                         handler_->get_leader(),
+                                         -1,
+                                         &args );
+                handler_->invoke_callback( cb_func::NewSessionFromLeader,
+                                           &cb_param );
+            }
+        }
 
         std::string meta_str;
         ptr<req_msg> req = cs_new<req_msg>
@@ -592,6 +657,20 @@ private:
     ptr<buffer> header_;
     ptr<logger> l_;
     session_closed_callback callback_;
+
+    /**
+     * Source server (endpoint) ID, used to check whether it is leader.
+     * This value is `-1` at the beginning, which denotes this session
+     * hasn't received any message from the endpoint.
+     * Note that this ID should not be changed throughout the life time
+     * of the session.
+     */
+    int32 src_id_;
+
+    /**
+     * `true` if the endpoint server was leader when it was last seen.
+     */
+    bool is_leader_;
 };
 
 // rpc listener implementation
@@ -741,8 +820,10 @@ public:
         , ssl_ready_(false)
         , num_send_fails_(0)
         , abandoned_(false)
+        , socket_busy_(false)
         , l_(l)
     {
+        client_id_ = impl_->assign_client_id();
         if (ssl_enabled_) {
 #ifdef SSL_LIBRARY_NOT_FOUND
             assert(0); // Should not reach here.
@@ -769,6 +850,10 @@ public:
     }
 
 public:
+    uint64_t get_id() const override {
+        return client_id_;
+    }
+
 #ifndef SSL_LIBRARY_NOT_FOUND
     bool verify_certificate(bool preverified,
                             asio::ssl::verify_context& ctx)
@@ -926,6 +1011,9 @@ public:
             return;
         }
 
+        // Socket should be idle now. If not, it should be a bug.
+        set_busy_flag(true);
+
         // If we reach here, that means connection is valid.
         // Reset the counter.
         num_send_fails_ = 0;
@@ -1010,6 +1098,24 @@ public:
                               std::placeholders::_2 ) );
     }
 private:
+    void set_busy_flag(bool to) {
+        if (to == true) {
+            bool exp = false;
+            if (!socket_busy_.compare_exchange_strong(exp, true)) {
+                p_ft("socket is already in use, race happened on connection to %s:%s",
+                     host_.c_str(), port_.c_str());
+                assert(0);
+            }
+        } else {
+            bool exp = true;
+            if (!socket_busy_.compare_exchange_strong(exp, false)) {
+                p_ft("socket is already idle, race happened on connection to %s:%s",
+                     host_.c_str(), port_.c_str());
+                assert(0);
+            }
+        }
+    }
+
     void close_socket() {
         // Do nothing,
         // early closing socket before destroying this instance
@@ -1214,6 +1320,7 @@ private:
                                  std::placeholders::_1,
                                  std::placeholders::_2 ) );
         } else {
+            set_busy_flag(false);
             ptr<rpc_exception> except;
             when_done(rsp, except);
         }
@@ -1233,6 +1340,8 @@ private:
             // just use the buffer as it is for ctx.
             ctx_buf->pos(0);
             rsp->set_ctx(ctx_buf);
+
+            set_busy_flag(false);
             ptr<rpc_exception> except;
             when_done(rsp, except);
             return;
@@ -1281,6 +1390,7 @@ private:
             rsp->set_ctx(actual_ctx);
         }
 
+        set_busy_flag(false);
         ptr<rpc_exception> except;
         when_done(rsp, except);
     }
@@ -1324,6 +1434,8 @@ private:
     std::atomic<bool> ssl_ready_;
     std::atomic<size_t> num_send_fails_;
     std::atomic<bool> abandoned_;
+    std::atomic<bool> socket_busy_;
+    uint64_t client_id_;
     ptr<logger> l_;
 };
 
@@ -1356,6 +1468,7 @@ asio_service_impl::asio_service_impl(const asio_service::options& _opt,
     , num_active_workers_(0)
     , worker_id_(0)
     , my_opt_(_opt)
+    , client_id_counter_(1)
     , l_(l)
 {
     if (my_opt_.enable_ssl_) {
@@ -1421,9 +1534,11 @@ std::string asio_service_impl::get_password
 #endif
 
 void asio_service_impl::worker_entry() {
-#ifdef __linux__
     std::string thread_name = "nuraft_w_" + std::to_string(worker_id_.fetch_add(1));
+#ifdef __linux__
     pthread_setname_np(pthread_self(), thread_name.c_str());
+#elif __APPLE__
+    pthread_setname_np(thread_name.c_str());
 #endif
 
     static std::atomic<size_t> exception_count(0);
